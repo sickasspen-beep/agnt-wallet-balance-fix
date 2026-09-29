@@ -1,0 +1,385 @@
+From 89512d9aa4d0c90acb9420c5cc34204244581591 Mon Sep 17 00:00:00 2001
+From: sickasspen-beep <267194820+sickasspen-beep@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 10:56:38 -0500
+Subject: [PATCH] fix: preserve authenticated wallet reads for lapsed accounts
+
+---
+ server.js                         |  13 ++-
+ tests/chat-wallet-error.test.js   | 125 +++++++++++++++++++++++++++++
+ tests/wallet-balance-auth.test.js | 128 ++++++++++++++++++++++++++++++
+ web/components/ChatPage.tsx       |  19 +++--
+ 4 files changed, 276 insertions(+), 9 deletions(-)
+ create mode 100644 tests/chat-wallet-error.test.js
+ create mode 100644 tests/wallet-balance-auth.test.js
+
+diff --git a/server.js b/server.js
+index a10a55ff..4ed71100 100644
+--- a/server.js
++++ b/server.js
+@@ -8862,12 +8862,19 @@ app.put('/api/wallet/hidden-tokens', requireAuth, async (req, res) => {
+   }
+ });
+ 
+-app.get('/api/wallet/balance', optionalAuth, publicBalanceLimiter, async (req, res) => {
++app.get('/api/wallet/balance', (req, res, next) => {
++  // Wallet reads use the same verified identity as /api/me and /net-curve.
++  // Privy's optionalAuth drops lapsed subscriptions even with a valid token.
++  // Only requests without credentials may use the anonymous address lookup.
++  return req.headers.authorization !== undefined
++    ? requireAuth(req, res, next)
++    : optionalAuth(req, res, next);
++}, publicBalanceLimiter, async (req, res) => {
+   const stmts = getUserStmts();
+   if (!stmts) return res.status(500).json({ error: 'Migration required' });
+ 
+-  // optionalAuth: signed-in → req.user set (full behavior); anonymous → req.user
+-  // undefined, and ONLY an explicit ?address= override is served (public on-chain
++  // Signed-in → req.user set (full behavior); anonymous → req.user null,
++  // and ONLY an explicit ?address= override is served (public on-chain
+   // data for that address, no user wallet, no launched-token augmentation). This
+   // powers human-wallet mode on the public /token pages.
+   const walletInfo = req.user ? await stmts.getUserWalletInfo.get(req.user.id) : null;
+diff --git a/tests/chat-wallet-error.test.js b/tests/chat-wallet-error.test.js
+new file mode 100644
+index 00000000..b8114945
+--- /dev/null
++++ b/tests/chat-wallet-error.test.js
+@@ -0,0 +1,125 @@
++'use strict';
++
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const test = require('node:test');
++const vm = require('node:vm');
++const ts = require('typescript');
++
++// Execute the actual wallet JSX and query destructuring, without mounting chat's
++// unrelated SDKs. A failed initial request must not masquerade as an empty wallet;
++// a failed refresh must keep the last holdings visible with a warning.
++const source = fs.readFileSync(path.join(__dirname, '../web/components/ChatPage.tsx'), 'utf8');
++const queryLine = source.split('\n').find(line => line.includes('= useWalletBalance();'));
++const unavailableLine = source.split('\n').find(line => line.includes('const walletBalanceUnavailable =')) || '';
++const start = source.indexOf('              {!walletReadOnly', source.indexOf('{/* Top tokens */}'));
++const end = source.indexOf('              {/* Dust', start);
++assert.ok(queryLine && start >= 0 && end > start, 'wallet render section must be found');
++const code = ts.transpileModule(`function render() {
++  ${queryLine}
++  return <>${source.slice(start, end)}</>;
++}
++result = render();`, { compilerOptions: {
++  jsx: ts.JsxEmit.React, target: ts.ScriptTarget.ES2022,
++} }).outputText;
++
++const headerStart = source.indexOf("<div style={{ position: 'relative', marginTop:", source.indexOf('{/* Value block.'));
++const headerEnd = source.lastIndexOf('</div>', source.indexOf('{/* Fund wallet'));
++assert.ok(headerStart >= 0 && headerEnd > headerStart, 'wallet header must be found');
++const headerCalculations = ['const totalUsd =', 'const pickedTotalUsd =', 'const usd24hAgo =', 'const delta24h =', 'const pct24h =']
++  .map(prefix => source.split('\n').find(line => line.trim().startsWith(prefix))).join('\n');
++const formatUsd = source.match(/function formatUsd\(n: number\): string \{[\s\S]*?\n\}/)[0];
++const headerCode = ts.transpileModule(`function render() {
++  ${queryLine}
++  ${unavailableLine}
++  ${formatUsd}
++  ${headerCalculations}
++  return <>${source.slice(headerStart, headerEnd)}</>;
++}
++result = render();`, { compilerOptions: {
++  jsx: ts.JsxEmit.React, target: ts.ScriptTarget.ES2022,
++} }).outputText;
++
++function render(query, holdings = [], { header = false, isMobile = false } = {}) {
++  const context = {
++    useWalletBalance: () => query,
++    useMemo: fn => fn(), holdings,
++    React: { Fragment: 'fragment', createElement: (type, props, ...children) => ({ type, props, children }) },
++    walletReadOnly: false, isMobile, walletLens: 'all', walletSort: 'value', lensCounts: {},
++    setWalletLens() {}, setWalletSort() {}, WalletFilterChip: 'filter',
++    topHoldings: holdings, openRowSym: null, canHide: false,
++    chainIcon: () => ({ src: '/base.png', label: 'Base' }),
++    getTokenizedStockByMint: () => null,
++    netCurve: { first: 100 }, pickedBalance: undefined, pickedLoading: false,
++    sparkPolyline: '0,48 300,0', walletScrolled: false, isSignedIn: false,
++    handleRefreshWallet() {}, walletRefreshing: false,
++  };
++  vm.runInNewContext(header ? headerCode : code, context);
++  const nodes = [];
++  function walk(node) {
++    if (Array.isArray(node)) return node.forEach(walk);
++    if (node == null || typeof node === 'boolean') return;
++    nodes.push(node);
++    if (typeof node === 'object') walk(node.children);
++  }
++  walk(context.result);
++  return {
++    text: nodes.filter(n => typeof n === 'string' || typeof n === 'number').join(' '),
++    alerts: nodes.filter(n => n?.props?.role === 'alert'),
++    labels: nodes.map(n => n?.props?.['aria-label']).filter(Boolean),
++    charts: nodes.filter(n => n?.type === 'svg' && n.props?.viewBox === '0 0 300 48'),
++  };
++}
++
++test('failed initial balance request reports failure instead of an empty wallet', () => {
++  const view = render({ data: undefined, isLoading: false, isError: true });
++  assert.equal(view.alerts.length, 1);
++  assert.match(view.text, /unable to load balances/i);
++  assert.match(view.text, /refresh/i);
++  assert.doesNotMatch(view.text, /no holdings yet/i);
++});
++
++test('failed refresh keeps previously loaded holdings visible with a stale warning', () => {
++  const view = render({ data: { balances: {} }, isLoading: false, isError: true }, [{
++    fullSymbol: 'USDC', symbol: 'U', chain: 'base', amount: '12', usd: '$12.00', pct24h: 0,
++    address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', hideKeys: [], logoUrl: null,
++  }]);
++  assert.equal(view.alerts.length, 1);
++  assert.match(view.text, /out of date/i);
++  assert.match(view.text, /USDC/);
++  assert.match(view.text, /\$12\.00/);
++  assert.doesNotMatch(view.text, /no holdings yet/i);
++});
++
++test('successful empty response still renders the empty state', () => {
++  const view = render({ data: { balances: {} }, isLoading: false, isError: false });
++  assert.equal(view.alerts.length, 0);
++  assert.match(view.text, /no holdings yet/i);
++});
++
++test('initial loading keeps its loading state without claiming the wallet is empty', () => {
++  const view = render({ data: undefined, isLoading: true, isError: false });
++  assert.equal(view.alerts.length, 0);
++  assert.match(view.text, /loading/i);
++  assert.doesNotMatch(view.text, /no holdings yet/i);
++});
++
++for (const isMobile of [false, true]) {
++  test(`failed initial balances cannot show a false loss against loaded history (${isMobile ? 'mobile' : 'desktop'})`, () => {
++    const view = render({ data: undefined, isLoading: false, isError: true }, [], { header: true, isMobile });
++    assert.ok(view.labels.includes('Total wallet value unavailable'));
++    assert.match(view.text, /—/);
++    assert.doesNotMatch(view.text, /100|%|24H/);
++    assert.doesNotMatch(view.labels.join(' '), /percent|24 hour/i);
++    assert.equal(view.charts.length, 0);
++  });
++
++  test(`failed refresh preserves the cached total and history (${isMobile ? 'mobile' : 'desktop'})`, () => {
++    const view = render({ data: { balances: {} }, isLoading: false, isError: true }, [{ usdNum: 50 }], { header: true, isMobile });
++    assert.match(view.text, /\$50\.00/);
++    assert.match(view.text, /-50\.0/);
++    assert.equal(view.charts.length, 1);
++    assert.ok(!view.labels.includes('Total wallet value unavailable'));
++  });
++}
+diff --git a/tests/wallet-balance-auth.test.js b/tests/wallet-balance-auth.test.js
+new file mode 100644
+index 00000000..033ad0d4
+--- /dev/null
++++ b/tests/wallet-balance-auth.test.js
+@@ -0,0 +1,128 @@
++'use strict';
++const test = require('node:test');
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const vm = require('node:vm');
++
++const OWN = '0x1111111111111111111111111111111111111111';
++const PUBLIC = '0x2222222222222222222222222222222222222222';
++const balances = { base: { nativeBalance: '1', nativeBalanceUSD: 2000, tokenBalances: [] } };
++const authSource = fs.readFileSync(require.resolve('../auth-privy'), 'utf8');
++const serverSource = fs.readFileSync(require.resolve('../server'), 'utf8');
++const routeSource = serverSource.slice(
++  serverSource.indexOf("app.get('/api/wallet/balance',"),
++  serverSource.indexOf('// Wallet NFT holdings, from OpenSea'),
++);
++
++// Exercise the registered middleware AND the shipped route; only external
++// identity verification, database access and chain reads are replaced.
++function harness(status = 'active', gated = false) {
++  const user = { id: 'fixture-user', privy_user_id: 'did:privy:fixture', status };
++  const reads = { wallets: [], balances: [] };
++  const stmts = {
++    getUserByPrivyId: { get: async () => gated ? null : user },
++    getUserWalletInfo: { get: async id => {
++      reads.wallets.push(id);
++      return { privy_wallet_address: OWN };
++    } },
++  };
++  const authContext = {
++    module: { exports: {} }, process: { env: { INVITE_GATE_ENABLED: gated ? 'true' : 'false' } },
++    console: { error() {}, warn() {} },
++    require(name) {
++      if (name === '@privy-io/server-auth') return { PrivyClient: class {
++        async verifyAuthToken(token) {
++          if (token !== 'valid') throw new Error('Invalid or expired token');
++          return { userId: user.privy_user_id };
++        }
++      } };
++      if (name === './privy-creds') return { getAppId: () => 'fixture', getAppSecret: () => 'fixture' };
++      if (name === './db-adapter') return { getUserStmts: () => stmts };
++      if (name === './invite-codes') return { hasReserved: async () => false };
++      throw new Error(`Unexpected auth dependency: ${name}`);
++    },
++  };
++  vm.runInNewContext(authSource, authContext);
++  const auth = authContext.module.exports;
++  let middleware;
++  vm.runInNewContext(routeSource, {
++    app: { get(path, ...handlers) { middleware = handlers; } },
++    ...auth, publicBalanceLimiter: (req, res, next) => next(),
++    getUserStmts: () => stmts, queryAll: async () => [],
++    EVM_ADDRESS_RE: /^0x[0-9a-f]{40}$/i, MAX_WALLET_BALANCE_EXTRAS: 20,
++    getWalletBalances: async (input) => {
++      reads.balances.push(input);
++      return { balances, providerLabel: 'fixture' };
++    },
++    sumBalancesUsd: () => 2000,
++    require: () => ({ recordSnapshot: async () => {} }),
++  });
++  return {
++    reads, auth,
++    async request(authorization, query = {}) {
++      const req = { headers: authorization === undefined ? {} : { authorization }, query };
++      let code = 200, body;
++      const res = { status(value) { code = value; return this; }, json(value) { body = value; return this; } };
++      async function run(index) {
++        let downstream;
++        await middleware[index](req, res, () => { downstream = run(index + 1); });
++        await downstream;
++      }
++      await run(0);
++      return { code, body: JSON.parse(JSON.stringify(body)) };
++    },
++  };
++}
++
++for (const status of ['active', 'cancelled', 'payment_failed']) {
++  test(`verified ${status} account can read its own wallet`, async () => {
++    const h = harness(status);
++    const result = await h.request('Bearer valid');
++    assert.equal(result.code, 200);
++    assert.equal(result.body.addresses.evm, OWN);
++    assert.deepEqual(result.body.balances, balances);
++    assert.equal(h.reads.balances[0].userId, 'fixture-user');
++  });
++}
++
++test('anonymous address lookup has no access to an account wallet', async () => {
++  const h = harness();
++  const result = await h.request(undefined, { address: PUBLIC });
++  assert.equal(result.code, 200);
++  assert.equal(result.body.addresses.evm, PUBLIC);
++  assert.equal(h.reads.balances[0].userId, null);
++  assert.deepEqual(h.reads.wallets, []);
++  assert.deepEqual(result.body.launchedTokens, []);
++});
++
++for (const [query, code] of [[{}, 401], [{ address: 'bad-address' }, 400]]) {
++  test(`anonymous invalid lookup returns ${code} without reading balances`, async () => {
++    const h = harness();
++    assert.equal((await h.request(undefined, query)).code, code);
++    assert.deepEqual(h.reads.balances, []);
++  });
++}
++
++for (const header of ['Bearer invalid', 'Bearer expired', 'Basic valid', 'Bearer', '']) {
++  test(`supplied invalid credential ${JSON.stringify(header)} cannot fall back to public mode`, async () => {
++    const h = harness();
++    assert.equal((await h.request(header, { address: PUBLIC })).code, 401);
++    assert.deepEqual(h.reads.wallets, []);
++    assert.deepEqual(h.reads.balances, []);
++  });
++}
++
++test('invite-gated new accounts remain denied', async () => {
++  const h = harness('active', true);
++  const result = await h.request('Bearer valid');
++  assert.equal(result.code, 403);
++  assert.equal(result.body.error, 'invite_required');
++  assert.deepEqual(h.reads.balances, []);
++});
++
++test('unrelated optional-auth routes retain their existing account-status policy', async () => {
++  const h = harness('cancelled');
++  const req = { headers: { authorization: 'Bearer valid' } };
++  await h.auth.optionalAuth(req, {}, () => {});
++  assert.equal(req.user, null);
++});
+diff --git a/web/components/ChatPage.tsx b/web/components/ChatPage.tsx
+index b4ed3bc9..1d11ccb6 100644
+--- a/web/components/ChatPage.tsx
++++ b/web/components/ChatPage.tsx
+@@ -435,7 +435,7 @@ export function ChatPageContent() {
+   // the Privy X profile picture so users who signed in with X get an image
+   // without having to upload one. See web/hooks/useIdentityPfp.ts.
+   const ownerPfp = useOwnerPfp(me, privyUser?.imageUrl);
+-  const { data: walletBalance, isLoading: walletBalanceLoading } = useWalletBalance();
++  const { data: walletBalance, isLoading: walletBalanceLoading, isError: walletBalanceError } = useWalletBalance();
+   // The wallet picker (agent default / Solana / an NFT's 6551 wallet). The
+   // agent's own balances above stay the source for every buy/sell/send card —
+   // those still trade from the agent wallet. When another wallet is picked the
+@@ -443,6 +443,7 @@ export function ChatPageContent() {
+   // in the panel stands down (trading from NFT/Solana wallets isn't wired yet).
+   const { data: pickedBalance, isLoading: pickedLoading, active: activeWallet } = useActiveWalletBalance();
+   const walletReadOnly = isReadOnlyWallet(activeWallet);
++  const walletBalanceUnavailable = !walletReadOnly && walletBalanceError && !walletBalance;
+   const { data: netCurve, refetch: refetchNetCurve } = useWalletNetCurve();
+   // Force-fresh balance (?refresh=1 → bypasses the server's ~20s balance cache),
+   // not a plain refetch that would just re-read the cached snapshot. Local
+@@ -1205,7 +1206,7 @@ export function ChatPageContent() {
+                   you still get the full-size number and curve.
+                   DESKTOP IS UNCHANGED — it has the room. */}
+               <div style={{ position: 'relative', marginTop: isMobile ? 2 : 8 }}>
+-                {isMobile && sparkPolyline && (
++                {isMobile && !walletBalanceUnavailable && sparkPolyline && (
+                   <div
+                     aria-hidden
+                     style={{
+@@ -1226,7 +1227,7 @@ export function ChatPageContent() {
+                   <div style={isMobile ? { display: 'flex', alignItems: 'baseline', gap: 8, minWidth: 0 } : { minWidth: 0 }}>
+                     <div
+                       style={{ fontFamily: 'var(--display)', fontSize: isMobile ? (walletScrolled ? 18 : 22) : 28, fontWeight: 700, letterSpacing: '-0.01em', color: 'var(--ink)', lineHeight: 1, fontVariantNumeric: 'tabular-nums', transition: 'font-size 180ms ease' }}
+-                      aria-label={walletBalanceLoading ? 'Total wallet value loading' : `Total wallet value ${formatUsd(totalUsd)}, ${pct24h >= 0 ? 'up' : 'down'} ${Math.abs(pct24h).toFixed(1)} percent over 24 hours`}
++                      aria-label={walletBalanceUnavailable ? 'Total wallet value unavailable' : walletBalanceLoading ? 'Total wallet value loading' : `Total wallet value ${formatUsd(totalUsd)}, ${pct24h >= 0 ? 'up' : 'down'} ${Math.abs(pct24h).toFixed(1)} percent over 24 hours`}
+                     >
+                       {walletReadOnly
+                         ? (pickedLoading ? '—' : formatUsd(pickedTotalUsd))
+@@ -1238,7 +1239,7 @@ export function ChatPageContent() {
+                         every pixel here is a token row the user doesn't see.
+                         DESKTOP keeps the full line below the number. */}
+                     {/* The 24h move is the agent wallet's history — nothing to say for another wallet. */}
+-                    {walletReadOnly ? null : isMobile ? (
++                    {walletReadOnly || walletBalanceUnavailable ? null : isMobile ? (
+                       <div style={{ fontFamily: 'var(--display)', fontSize: 12, fontWeight: 600, letterSpacing: '0.02em', color: pct24h >= 0 ? 'var(--pos)' : 'var(--neg)', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' }}>
+                         {pct24h >= 0 ? '▲' : '▼'} {pct24h >= 0 ? '+' : ''}{pct24h.toFixed(1)}%
+                       </div>
+@@ -1284,7 +1285,7 @@ export function ChatPageContent() {
+ 
+               {/* Desktop keeps the standalone sparkline box — it has the room,
+                   and a dedicated strip reads better at sidebar width. */}
+-              {!isMobile && !walletReadOnly && (
++              {!isMobile && !walletReadOnly && !walletBalanceUnavailable && (
+                 <div
+                   role="img"
+                   aria-label={`24 hour balance trend, ${pct24h >= 0 ? 'up' : 'down'} ${Math.abs(pct24h).toFixed(1)} percent`}
+@@ -1343,11 +1344,17 @@ export function ChatPageContent() {
+               </div>
+               )}
+ 
++              {!walletReadOnly && walletBalanceError && (
++                <div role="alert" style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--neg)', padding: '12px 4px' }}>
++                  {walletBalance ? 'Balances may be out of date. Try refreshing.' : 'Unable to load balances. Try refreshing.'}
++                </div>
++              )}
++
+               {walletReadOnly ? (
+                 <ActiveWalletHoldings wallet={activeWallet} balances={pickedBalance?.balances} loading={pickedLoading} onSend={() => { setActiveCard({ kind: 'send' }); if (isMobile) setWalletOpen(false); }} onFund={() => { setActiveCard({ kind: 'near_bridge' }); if (isMobile) setWalletOpen(false); }} />
+               ) : walletBalanceLoading ? (
+                 <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--ink-3)', padding: '12px 4px' }}>Loading…</div>
+-              ) : topHoldings.length === 0 ? (
++              ) : topHoldings.length === 0 && !walletBalanceError ? (
+                 <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--ink-3)', padding: '12px 4px' }}>No holdings yet</div>
+               ) : topHoldings.map(h => {
+                 const ci = chainIcon(h.chain);
+-- 
+2.50.1 (Apple Git-155)
+
